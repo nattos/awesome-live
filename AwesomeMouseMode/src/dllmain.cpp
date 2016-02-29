@@ -1,10 +1,13 @@
 #include "stdafx.h"
+#include "vstsdk2.4/pluginterfaces/vst2.x/aeffectx.h"
 
 namespace {
 
 // Constants affecting plugin behaviour.
 // Constants instead of defines so these can be turned into runtime options.
 constexpr bool kEnableDigitizerFix = true;
+constexpr bool kEnableTouchPanGesture = true;
+constexpr bool kEnableTouchpadZoom = true;
 constexpr bool kEnableMultiTouch = false; // Not working.
 
 constexpr bool kEnableScrollingOverride = true;
@@ -28,7 +31,7 @@ struct WindowData {
 std::recursive_mutex* gStateLock = nullptr;
 std::unordered_map<HWND, WindowData>* gWindowMap = nullptr;
 
-static bool gDragDown = false;
+bool gDragDown = false;
 POINT gDragDownPoint = { 0, };
 POINT gDragPrevDigitizerPoint = { 0, };
 POINT gDragDigitizerDelta = { 0, };
@@ -37,6 +40,11 @@ bool gWasDigitizerClick = false;
 bool gHadDigitizerClick = false;
 int gHadDoubleClick = 0;
 POINT gWheelDeltaAcc = { 0, };
+int gWheelZoomDeltaAcc = 0;
+bool gInPanGesture = false;
+bool gPanGestureDown = false;
+bool gPanGestureInInertia = false;
+POINT gPanGestureLastPos = { 0, };
 
 
 INPUT MakeKeyboardEvent(int vk, bool keyUp);
@@ -78,6 +86,7 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		data = findIt->second;
 	}
 
+	WORD loword = LOWORD(wParam);
 	switch (msg) {
 	case WM_LBUTTONDOWN:
 		if (kEnableDigitizerFix) {
@@ -110,6 +119,20 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 		break;
 	case WM_MOUSEMOVE:
+		if (!gInPanGesture && gPanGestureDown) {
+			// Cancel pan because the mouse is moving.
+			gPanGestureDown = false;
+			DEBUG_TRACE(_T("MOUSEMOVE: Force Pan Gesture Up\n"));
+			::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gPanGestureLastPos.x, gPanGestureLastPos.y));
+			return 0L;
+		} else if (gPanGestureDown && !gPanGestureInInertia && !(gPanGestureLastPos.x == GET_X_LPARAM(lParam) && gPanGestureLastPos.y == GET_Y_LPARAM(lParam))) {
+			// The mouse moved while panning. Ignore it.
+			return 0L;
+		} else {
+			// We get one WM_MOUSEMOVE event just after the gesture begins. We need to treat it as a
+			// non-mouse event, and skip canceling the pan.
+			gInPanGesture = false;
+		}
 		if (kEnableDigitizerFix) {
 			CURSORINFO cursorInfo;
 			::memset(&cursorInfo, 0, sizeof(cursorInfo));
@@ -171,8 +194,8 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					}
 				}
 			}
-			break;
 		}
+		break;
 	case WM_KEYDOWN:
 		if (kEnableCtrlShiftZ && wParam == 'Z' && HIBYTE(::GetKeyState(VK_CONTROL)) && HIBYTE(::GetKeyState(VK_SHIFT))) {
 			INPUT input[] = {
@@ -193,16 +216,77 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 		break;
 
+	case WM_GESTURENOTIFY:
+		if (kEnableTouchPanGesture) {
+			GESTURECONFIG gc;
+			::memset(&gc, 0, sizeof(gc));
+			gc.dwID = GID_PAN;
+			gc.dwWant = GC_PAN | GC_PAN_WITH_INERTIA | GC_PAN_WITH_SINGLE_FINGER_HORIZONTALLY | GC_PAN_WITH_SINGLE_FINGER_VERTICALLY;
+			gc.dwBlock = 0;
+			::SetGestureConfig(hwnd, 0, 1, &gc, sizeof(GESTURECONFIG));
+		}
+		break;
+
 	case WM_GESTURE:
-		if (kEnableMultiTouch) {
-			// _TODO_
+		if (kEnableTouchPanGesture) {
 			GESTUREINFO gesture;
 			::memset(&gesture, 0, sizeof(gesture));
 			gesture.cbSize = sizeof(gesture);
 			bool consumed = false;
-			if (::GetGestureInfo((HGESTUREINFO) lParam, &gesture) && (gesture.dwFlags & GF_INERTIA)) {
+			if (::GetGestureInfo((HGESTUREINFO) lParam, &gesture)) {
 				if (gesture.dwID == GID_PAN) {
-					gesture.ullArguments;
+					// Fake a smooth pan by Ctrl+Alt clicking and dragging.
+					DEBUG_TRACE(_T("GID_PAN: %d %ld, [%d, %d]\n"), gesture.dwFlags, gesture.ullArguments, gesture.ptsLocation.x, gesture.ptsLocation.y);
+					bool restartedGesture = gPanGestureInInertia && gesture.dwFlags == 0;
+					if (restartedGesture || (gesture.dwFlags & GF_BEGIN)) {
+						// Cancel our current Ctrl+Alt click if it was already down.
+						if (gPanGestureDown) {
+							::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gPanGestureLastPos.x, gPanGestureLastPos.y));
+						}
+						// Simulate a Ctrl+Alt click.
+						gInPanGesture = true;
+						gPanGestureDown = true;
+						gPanGestureInInertia = false;
+						{
+							INPUT input[] = {
+								MakeKeyboardEvent(VK_CONTROL, false),
+								MakeKeyboardEvent(VK_MENU, false),
+							};
+							::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
+						}
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y+1));
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONDOWN, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y+1));
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+						{
+							INPUT input[] = {
+								MakeKeyboardEvent(VK_CONTROL, true),
+								MakeKeyboardEvent(VK_MENU, true),
+							};
+							::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
+						}
+						gPanGestureLastPos.x = gesture.ptsLocation.x;
+						gPanGestureLastPos.y = gesture.ptsLocation.y;
+					}
+					if (gesture.dwFlags & GF_INERTIA) {
+						gPanGestureInInertia = true;
+						gInPanGesture = false;
+					}
+					if (gesture.dwFlags & GF_END) {
+						// Cancel our current Ctrl+Alt click because the gesture is over completely.
+						gPanGestureInInertia = false;
+						if (gPanGestureDown) {
+							gPanGestureDown = false;
+							::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+						}
+					}
+
+					if (!(gesture.dwFlags & GF_BEGIN) && gPanGestureDown) {
+						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+						gPanGestureLastPos.x = gesture.ptsLocation.x;
+						gPanGestureLastPos.y = gesture.ptsLocation.y;
+					}
 					consumed = true;
 				}
 			}
@@ -214,13 +298,45 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 
 	case WM_MOUSEWHEEL:
-		if (kEnableScrollingOverride) {
-			WORD loword = LOWORD(wParam);
+		if (kEnableTouchpadZoom && (loword == MK_CONTROL)) {
+			// Either we got sent a touchpad zoom emulation event, or the user is scrolling while holding
+			// control. We can't tell the difference, so just assume it's a zoom event.
+			int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+			int deltaAcc = gWheelZoomDeltaAcc + delta;
+			int outDelta = deltaAcc / WHEEL_DELTA;
+			deltaAcc -= outDelta * WHEEL_DELTA;
+			gWheelZoomDeltaAcc = deltaAcc;
+			if (outDelta != 0) {
+				int deltas = std::abs(outDelta);
+				DWORD zoomVKey = outDelta > 0 ? VK_OEM_PLUS : VK_OEM_MINUS;
+				{ 
+					INPUT input[] = {
+						MakeKeyboardEvent(VK_CONTROL, true),
+					};
+					::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
+				}
+				for (int i = 0 ; i < deltas; i++) {
+					INPUT input[] = {
+						MakeKeyboardEvent(zoomVKey, false),
+						MakeKeyboardEvent(zoomVKey, true),
+					};
+					::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
+				}
+				{
+					INPUT input[] = {
+						MakeKeyboardEvent(VK_CONTROL, false),
+					};
+					::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
+				}
+			}
+
+			return 0L;
+		} if (kEnableScrollingOverride) {
 			int delta = GET_WHEEL_DELTA_WPARAM(wParam);
 			int outDelta = 0;
 			int deltaAcc = gWheelDeltaAcc.y;
 			deltaAcc += (delta * kWheelYScaleNumerator) / kWheelYScaleDenominator;
-			outDelta = (std::abs(deltaAcc) / kMinWheelDelta) * (deltaAcc > 0 ? 1 : -1) * kMinWheelDelta;
+			outDelta = (deltaAcc / kMinWheelDelta) * kMinWheelDelta;
 			gWheelDeltaAcc.y = deltaAcc - outDelta;
 
 			if (outDelta == 0) {
@@ -237,7 +353,7 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			int outDelta = 0;
 			int deltaAcc = gWheelDeltaAcc.x;
 			deltaAcc += (delta * -kWheelXScaleNumerator) / kWheelXScaleDenominator;
-			outDelta = (std::abs(deltaAcc) / kMinWheelDelta) * (deltaAcc > 0 ? 1 : -1) * kMinWheelDelta;
+			outDelta = (deltaAcc / kMinWheelDelta) * kMinWheelDelta;
 			gWheelDeltaAcc.x = deltaAcc - outDelta;
 
 			if (outDelta == 0) {
@@ -351,7 +467,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReasonForCall, LPVOID lpReserved)
 		if (!gWindowMap) {
 			gWindowMap = new std::unordered_map<HWND, WindowData>();
 		}
-		hHook = ::SetWinEventHook(WM_DESTROY, WM_KILLFOCUS, hModule, OurWinEventProc, ::GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
+		hHook = ::SetWinEventHook(WM_CREATE, WM_KILLFOCUS, hModule, OurWinEventProc, ::GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
 		break;
 	case DLL_PROCESS_DETACH:
 		if (!lpReserved) {

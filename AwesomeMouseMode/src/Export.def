@@ -1,0 +1,4 @@
+EXPORTS
+	VSTMain
+	main=VSTMain
+	DllMain

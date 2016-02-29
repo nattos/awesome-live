@@ -9,6 +9,9 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Source Files\vst2.4">
+      <UniqueIdentifier>{45cf7731-ae00-467f-a1c0-82a8845ae8d5}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stdafx.h">
@@ -16,6 +19,15 @@
     </ClInclude>
     <ClInclude Include="targetver.h">
       <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\extlib\vstsdk2.4\public.sdk\source\vst2.x\aeffeditor.h">
+      <Filter>Source Files\vst2.4</Filter>
+    </ClInclude>
+    <ClInclude Include="..\extlib\vstsdk2.4\public.sdk\source\vst2.x\audioeffect.h">
+      <Filter>Source Files\vst2.4</Filter>
+    </ClInclude>
+    <ClInclude Include="..\extlib\vstsdk2.4\public.sdk\source\vst2.x\audioeffectx.h">
+      <Filter>Source Files\vst2.4</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -25,5 +37,19 @@
     <ClCompile Include="dllmain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\extlib\vstsdk2.4\public.sdk\source\vst2.x\audioeffect.cpp">
+      <Filter>Source Files\vst2.4</Filter>
+    </ClCompile>
+    <ClCompile Include="..\extlib\vstsdk2.4\public.sdk\source\vst2.x\audioeffectx.cpp">
+      <Filter>Source Files\vst2.4</Filter>
+    </ClCompile>
+    <ClCompile Include="VstMain.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Export.def">
+      <Filter>Source Files</Filter>
+    </None>
   </ItemGroup>
 </Project>
