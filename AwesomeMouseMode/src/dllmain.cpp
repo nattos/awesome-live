@@ -7,7 +7,7 @@ namespace {
 // Constants instead of defines so these can be turned into runtime options.
 constexpr bool kEnableDigitizerFix = true;
 constexpr bool kEnableTouchPanGesture = true;
-constexpr bool kEnableTouchpadZoom = true;
+constexpr bool kEnableTrackpadZoom = true;
 constexpr bool kEnableMultiTouch = false; // Not working.
 
 constexpr bool kEnableScrollingOverride = true;
@@ -32,6 +32,7 @@ std::recursive_mutex* gStateLock = nullptr;
 std::unordered_map<HWND, WindowData>* gWindowMap = nullptr;
 
 bool gDragDown = false;
+bool gDragPenDown = false;
 POINT gDragDownPoint = { 0, };
 POINT gDragPrevDigitizerPoint = { 0, };
 POINT gDragDigitizerDelta = { 0, };
@@ -45,6 +46,8 @@ bool gInPanGesture = false;
 bool gPanGestureDown = false;
 bool gPanGestureInInertia = false;
 POINT gPanGestureLastPos = { 0, };
+POINT gPanGestureBestRealPos = { 0, };
+bool gInTrackpadScroll = false;
 
 
 INPUT MakeKeyboardEvent(int vk, bool keyUp);
@@ -96,6 +99,9 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				DEBUG_TRACE(_T("BUTTONDOWN: [%d, %d]\n"), mpos.x, mpos.y);
 				gHadDigitizerClick = true;
 				gHadDigitizerEvent = true;
+				gDragPenDown = true;
+			} else {
+				gDragPenDown = false;
 			}
 			gDragDown = true;
 			gDragDownPoint = mpos;
@@ -106,6 +112,7 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 	case WM_LBUTTONUP:
 		gDragDown = false;
+		gDragPenDown = false;
 		break;
 	case WM_LBUTTONDBLCLK:
 		if (kEnableDigitizerFix) {
@@ -119,19 +126,27 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 		break;
 	case WM_MOUSEMOVE:
-		if (!gInPanGesture && gPanGestureDown) {
-			// Cancel pan because the mouse is moving.
-			gPanGestureDown = false;
-			DEBUG_TRACE(_T("MOUSEMOVE: Force Pan Gesture Up\n"));
-			::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gPanGestureLastPos.x, gPanGestureLastPos.y));
-			return 0L;
-		} else if (gPanGestureDown && !gPanGestureInInertia && !(gPanGestureLastPos.x == GET_X_LPARAM(lParam) && gPanGestureLastPos.y == GET_Y_LPARAM(lParam))) {
-			// The mouse moved while panning. Ignore it.
-			return 0L;
-		} else {
-			// We get one WM_MOUSEMOVE event just after the gesture begins. We need to treat it as a
-			// non-mouse event, and skip canceling the pan.
-			gInPanGesture = false;
+		if (kEnableTouchPanGesture) {
+			if (!gInPanGesture && gPanGestureDown) {
+				// Cancel pan because the mouse is moving.
+				gPanGestureDown = false;
+				DEBUG_TRACE(_T("MOUSEMOVE: Force Pan Gesture Up\n"));
+				::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gPanGestureLastPos.x, gPanGestureLastPos.y));
+				::SetCursorPos(gPanGestureBestRealPos.x, gPanGestureBestRealPos.y);
+				return 0L;
+			} else if (gPanGestureDown && !gPanGestureInInertia && !(gPanGestureLastPos.x == GET_X_LPARAM(lParam) && gPanGestureLastPos.y == GET_Y_LPARAM(lParam))) {
+				// The mouse moved while panning. Ignore it.
+				return 0L;
+			} else {
+				// We get one WM_MOUSEMOVE event just after the gesture begins. We need to treat it as a
+				// non-mouse event, and skip canceling the pan.
+				gInPanGesture = false;
+				if (!gPanGestureDown) {
+					POINT realScreenPoint;
+					::GetCursorPos(&realScreenPoint);
+					gPanGestureBestRealPos = realScreenPoint;
+				}
+			}
 		}
 		if (kEnableDigitizerFix) {
 			CURSORINFO cursorInfo;
@@ -148,10 +163,16 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 			DEBUG_TRACE(_T("MOUSEMOVE [%d, %d] Cursor: %s Pen: %s\n"), mx, my, cursorShown ? _T("true") : _T("false"), isPenEvent ? _T("true") : _T("false"));
 			if (!cursorShown) {
+				bool isCtrlOrShift = (wParam & MK_CONTROL) || (wParam & MK_SHIFT);
 				bool isErrantEvent = isPenEvent && gHadDigitizerEvent && mx == gDragDownPoint.x && my == gDragDownPoint.y;
 				if (isPenEvent && !isErrantEvent) {
+					bool wasAcknowledged = !gHadDigitizerEvent;
 					gHadDigitizerEvent = true;
 					gWasDigitizerClick = true;
+					if (isCtrlOrShift && !wasAcknowledged) {
+						lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
+						break;
+					}
 					int dx = mx - gDragPrevDigitizerPoint.x;
 					int dy = my - gDragPrevDigitizerPoint.y;
 					gDragPrevDigitizerPoint.x = mx;
@@ -160,13 +181,23 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					gDragDigitizerDelta.y += dy;
 					int targetDX = gDragDigitizerDelta.x;
 					int targetDY = gDragDigitizerDelta.y;
+					if (!wasAcknowledged && ((std::abs(targetDX) < 3 && std::abs(targetDY) < 3) || (rand() % 100) > 70)) {
+						lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
+						break;
+					}
+					//if (wParam & MK_CONTROL) {
+					//	targetDX = 0;
+					//	targetDY = 0;
+					//}
 					int targetX = gDragDownPoint.x + targetDX;
 					int targetY = gDragDownPoint.y + targetDY;
 					// Tell Live the mouse moved a small distance from where the button was originally pressed.
-					DEBUG_TRACE(_T("[%d, %d] -> [%d, %d]\n"), gDragDownPoint.x, gDragDownPoint.y, dx, dy);
+					DEBUG_TRACE(_T("[%d, %d] -> [%d, %d]\n"), gDragDownPoint.x, gDragDownPoint.y, targetDX, targetDY);
 					lParam = MAKELONG((short) targetX, (short) targetY);
+					gDragDigitizerDelta.x = 0;
+					gDragDigitizerDelta.y = 0;
 				} else {
-					if (gHadDigitizerEvent) {
+					if (gHadDigitizerEvent || gDragPenDown) {
 						DEBUG_TRACE(_T("Reset: [%d, %d] Errant: %s\n"), gDragDownPoint.x, gDragDownPoint.y, isErrantEvent ? _T("true") : _T("false"));
 						if (gHadDigitizerClick) {
 							// Record the location Live thinks the mouse button was pressed.
@@ -177,13 +208,25 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 						// Live has acknowledged the mouse move, and forced the cursor back to where
 						// it thinks the button went down. That means we can reset our running
 						// delta.
-						gDragDigitizerDelta.x = 0;
-						gDragDigitizerDelta.y = 0;
+						if (isCtrlOrShift) {
+							gDragDigitizerDelta.x = 0;
+							gDragDigitizerDelta.y = 0;
+						//	gDragDownPoint.x = mx;
+						//	gDragDownPoint.y = my;
+							lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
+						}
 						gHadDigitizerEvent = false;
-						lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
+					//	lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
 					} else {
-						gDragDownPoint.x = mx;
-						gDragDownPoint.y = my;
+						//gDragDownPoint.x = mx;
+						//gDragDownPoint.y = my;
+						//if (isCtrlOrShift) {
+						//	gDragDigitizerDelta.x = 0;
+						//	gDragDigitizerDelta.y = 0;
+						//	//gDragDownPoint.x = mx;
+						//	//gDragDownPoint.y = my;
+						//	lParam = MAKELONG((short) gDragDownPoint.x, (short) gDragDownPoint.y);
+						//}
 					}
 				}
 			} else {
@@ -254,11 +297,11 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 							};
 							::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
 						}
-						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y+1));
+						POINT screenTouchPoint = { gesture.ptsLocation.x, gesture.ptsLocation.y };
+						::ClientToScreen(hwnd, &screenTouchPoint);
+						::SetCursorPos(screenTouchPoint.x, screenTouchPoint.y);
 						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
 						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONDOWN, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
-						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y+1));
-						::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_MOUSEMOVE, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
 						{
 							INPUT input[] = {
 								MakeKeyboardEvent(VK_CONTROL, true),
@@ -274,11 +317,12 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 						gInPanGesture = false;
 					}
 					if (gesture.dwFlags & GF_END) {
-						// Cancel our current Ctrl+Alt click because the gesture is over completely.
+						// Cancel our current Ctrl+Alt click because the gesture is completely over.
 						gPanGestureInInertia = false;
 						if (gPanGestureDown) {
 							gPanGestureDown = false;
 							::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, WM_LBUTTONUP, 0, MAKELONG(gesture.ptsLocation.x, gesture.ptsLocation.y));
+							::SetCursorPos(gPanGestureBestRealPos.x, gPanGestureBestRealPos.y);
 						}
 					}
 
@@ -298,7 +342,7 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 
 	case WM_MOUSEWHEEL:
-		if (kEnableTouchpadZoom && (loword == MK_CONTROL)) {
+		if (kEnableTrackpadZoom && !gInTrackpadScroll && (loword == MK_CONTROL)) {
 			// Either we got sent a touchpad zoom emulation event, or the user is scrolling while holding
 			// control. We can't tell the difference, so just assume it's a zoom event.
 			int delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -367,7 +411,9 @@ LRESULT CALLBACK OurWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				};
 				::SendInput(sizeof(input) / sizeof(INPUT), input, sizeof(INPUT));
 			}
+			gInTrackpadScroll = true;
 			LRESULT ret = ::CallWindowProc((WNDPROC) data.oldWndProc, hwnd, msg, wParam, lParam);
+			gInTrackpadScroll = false;
 			{
 				INPUT input[] = {
 					MakeKeyboardEvent(VK_CONTROL, true),
